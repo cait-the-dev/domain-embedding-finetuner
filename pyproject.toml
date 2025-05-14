@@ -1,0 +1,22 @@
+[tool.poetry]
+name = "domain-embedding-finetuner"
+version = "0.1.0"
+description = "Lightweight pipeline to parse a domain-specific PDF, generate training data, fine-tune a Llama-3.2 (1B) SLM, and compare embedding performance against the base model."
+authors = ["Caitlin Arnspiger <caitthedev@gmail.com>"]
+license = "MIT"
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.10"
+pdfplumber = "^0.11.6"
+pyyaml = "^6.0.2"
+
+
+[tool.poetry.group.dev.dependencies]
+jupyter = "^1.1.1"
+black = "^25.1.0"
+isort = "^6.0.1"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
