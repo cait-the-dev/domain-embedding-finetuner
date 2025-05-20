@@ -1,0 +1,7 @@
+paths:
+  pdf: data/raw/army_manual.pdf
+  chunks_jsonl: data/pdf_chunks.jsonl
+
+ingest:
+  max_tokens: 300
+  overlap: 0.25
