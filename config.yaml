@@ -1,0 +1,32 @@
+paths:
+  pdf: data/raw/army_manual.pdf
+  pdf_chunks_jsonl: data/pdf_chunks.jsonl
+  eval_manual_jsonl: data/eval_manual.jsonl      # 20 hand-written
+  eval_holdout_jsonl: data/eval_holdout.jsonl    # 30 held-out synthetic
+  finetuned_gguf: models/finetuned.gguf
+
+ingest:
+  max_tokens: 300
+  overlap: 0.25
+
+finetune:
+  base_model_id: QuantFactory/Llama-3.2-1B
+  output_dir: models/lora_adapter
+  merged_gguf: models/finetuned.gguf
+
+  lora_r: 8
+  lora_alpha: 32
+  lora_dropout: 0.10
+  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+
+  batch_size: 8
+  grad_accum: 4
+  num_epochs: 2
+  max_seq_len: 2048
+  learning_rate: 2e-4
+
+evaluate:
+  top_k: 3
+  max_eval: 50   
+  n_threads: 8
+  
