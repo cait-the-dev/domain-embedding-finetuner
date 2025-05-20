@@ -1,80 +1,127 @@
-import argparse
+import argparse, logging, torch
+from datasets import load_dataset
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    BitsAndBytesConfig,
+    TrainingArguments,
+    Trainer,
+)
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from pathlib import Path
+from utils import load_config
 
-import torch
-from transformers import (AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig,
-                          Trainer, TrainingArguments)
-from peft import get_peft_model, LoraConfig, prepare_model_for_kbit_training
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
-from utils import load_config, load_jsonl
+def make_dataset(train_path: str, tokenizer, max_len: int):
+    raw_ds = load_dataset("json", data_files=train_path, split="train")
 
+    def _tokenize(example):
+        prompt = f"<s>[INST] {example['question']} [/INST] {example['answer']} </s>"
+        ids = tokenizer(
+            prompt,
+            add_special_tokens=False,
+            truncation=True,
+            max_length=max_len,
+        )["input_ids"]
+        return {"input_ids": ids, "labels": ids.copy()}
 
-class QADataset(torch.utils.data.Dataset):
-    def __init__(self, rows, tok, max_len=2048):
-        self.tok = tok
-        self.rows = rows
-        self.max_len = max_len
-
-    def __len__(self):
-        return len(self.rows)
-
-    def __getitem__(self, idx):
-        qa = self.rows[idx]
-        prompt = f"### Question:\n{qa['question']}\n\n### Answer:\n{qa['answer']}\n"
-        ids = self.tok(prompt, truncation=True, max_length=self.max_len, return_tensors="pt")
-        ids["labels"] = ids["input_ids"].clone()
-        return ids
-
+    tokenized = raw_ds.map(_tokenize, remove_columns=list(raw_ds.features))
+    return tokenized
 
 def main(cfg_path: str):
     cfg = load_config(cfg_path)
-    train_rows = load_jsonl(cfg["paths"]["train_jsonl"])
+    ft_cfg = cfg["finetune"]
+    paths = cfg["paths"]
 
-    base_model = cfg["model"]["name"]
-    bnb_cfg = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True)
-
-    model = AutoModelForCausalLM.from_pretrained(base_model, quantization_config=bnb_cfg, device_map="auto")
-    tokenizer = AutoTokenizer.from_pretrained(base_model)
+    tokenizer = AutoTokenizer.from_pretrained(ft_cfg["base_model_id"])
     tokenizer.pad_token = tokenizer.eos_token
 
-    model = prepare_model_for_kbit_training(model)
+    bnb_cfg = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_compute_dtype=torch.bfloat16,
+    )
+    logging.info("Loading base model …")
+    base_model = AutoModelForCausalLM.from_pretrained(
+        ft_cfg["base_model_id"], quantization_config=bnb_cfg, device_map="auto"
+    )
+    base_model = prepare_model_for_kbit_training(base_model)
 
-    lora_cfg = LoraConfig(
-        r=cfg["lora"]["r"],
-        lora_alpha=cfg["lora"]["alpha"],
-        lora_dropout=cfg["lora"].get("dropout", 0.1),
-        target_modules=cfg["lora"]["target_modules"],
+    lora = LoraConfig(
+        r=ft_cfg["lora_r"],
+        lora_alpha=ft_cfg["lora_alpha"],
+        lora_dropout=ft_cfg["lora_dropout"],
         bias="none",
         task_type="CAUSAL_LM",
+        target_modules=ft_cfg["target_modules"],
     )
-    model = get_peft_model(model, lora_cfg)
+    model = get_peft_model(base_model, lora)
+    model.print_trainable_parameters()
 
-    ds = QADataset(train_rows, tokenizer)
+    train_jsonl = paths["train_jsonl"] 
+    ds = make_dataset(train_jsonl, tokenizer, ft_cfg["max_seq_len"])
 
-    out_dir = Path(cfg["paths"]["ft_dir"])
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    args = TrainingArguments(
-        output_dir=out_dir,
-        num_train_epochs=cfg["train"]["epochs"],
-        per_device_train_batch_size=cfg["train"]["batch"],
-        gradient_accumulation_steps=cfg["train"].get("grad_accum", 4),
-        optim="adamw_torch",
-        learning_rate=cfg["train"].get("lr", 2e-4),
-        fp16=False,
-        logging_steps=10,
-        save_strategy="no",
+    training_args = TrainingArguments(
+        output_dir=ft_cfg["output_dir"],
+        num_train_epochs=ft_cfg["num_epochs"],
+        per_device_train_batch_size=ft_cfg["batch_size"],
+        gradient_accumulation_steps=ft_cfg["grad_accum"],
+        learning_rate=ft_cfg["learning_rate"],
+        lr_scheduler_type="cosine",
+        bf16=True, 
+        logging_steps=20,
+        save_strategy="epoch",
+        report_to="none",
     )
 
-    trainer = Trainer(model=model, args=args, train_dataset=ds)
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=ds,
+        data_collator=lambda data: {
+            "input_ids": torch.nn.utils.rnn.pad_sequence(
+                [torch.tensor(f["input_ids"]) for f in data],
+                batch_first=True,
+                padding_value=tokenizer.pad_token_id,
+            ),
+            "labels": torch.nn.utils.rnn.pad_sequence(
+                [torch.tensor(f["labels"]) for f in data],
+                batch_first=True,
+                padding_value=-100,
+            ),
+        },
+    )
+
+    logging.info("Start training …")
     trainer.train()
+    logging.info("Training done.")
 
-    # merge and convert to gguf
-    model.save_pretrained(out_dir / "peft")
-    print("[finetune] PEFT adapter saved. To merge & convert ➜ convert_to_gguf.py")
+    model.save_pretrained(ft_cfg["output_dir"])
+    tokenizer.save_pretrained(ft_cfg["output_dir"])
 
+    logging.info("Merging LoRA adapter into base weights …")
+    merged = model.merge_and_unload()
+    merged.save_pretrained(ft_cfg["output_dir"] + "/merged")
+
+    gguf_out = Path(ft_cfg["merged_gguf"]).expanduser()
+    logging.info("Converting to GGUF → %s", gguf_out)
+    try:
+        from llama_cpp import convert
+    except ImportError:
+        logging.error("llama_cpp not installed; skip GGUF conversion.")
+    else:
+        convert(
+            model_path=(ft_cfg["output_dir"] + "/merged"),
+            out_path=str(gguf_out),
+            vocab_type="llama",
+            use_mmap=False,
+        )
+    logging.info("✅ Finetune complete")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="config.yaml")
-    main(**vars(parser.parse_args()))
+    args = parser.parse_args()
+    main(args.config)

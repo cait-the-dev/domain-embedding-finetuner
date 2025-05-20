@@ -10,7 +10,7 @@ from typing import List
 
 from tenacity import retry, stop_after_attempt, wait_random_exponential
 
-from utils import load_config, load_jsonl, save_jsonl
+from src.utils import load_config, load_jsonl, save_jsonl
 
 try:
     from openai import OpenAI 
