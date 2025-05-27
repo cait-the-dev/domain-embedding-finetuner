@@ -3,24 +3,17 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import re
 import time
 from pathlib import Path
 from typing import Dict, List
 
-import numpy as np
 import yaml
-from sentence_transformers import SentenceTransformer
-
-try:
-    import faiss
-
-    HAVE_FAISS = True
-except ModuleNotFoundError:
-    from sklearn.neighbors import NearestNeighbors
-
-    HAVE_FAISS = False
-
 from llama_cpp import Llama
+
+from src.prompts import build_rag_prompt
+from src.retrieval import Retriever
+from src.utils import default_ctx, num_tokens
 
 
 def load_jsonl(path: str | Path) -> List[Dict]:
@@ -28,80 +21,70 @@ def load_jsonl(path: str | Path) -> List[Dict]:
         return [json.loads(l) for l in fh]
 
 
-def build_index(texts: List[str], model: SentenceTransformer):
-    vecs = (
-        model.encode(texts, show_progress_bar=False, normalize_embeddings=True)
-        .astype("float32")
-        .copy()
-    )
-
-    if HAVE_FAISS:
-        index = faiss.IndexFlatIP(vecs.shape[1])
-        index.add(vecs)
-        knn = lambda q_vec, k: index.search(np.array([q_vec], dtype="float32"), k)[1][0]
-    else:
-        nn = NearestNeighbors(metric="cosine").fit(vecs)
-        knn = lambda q_vec, k: nn.kneighbors(
-            [q_vec], n_neighbors=k, return_distance=False
-        )[0]
-
-    return knn
-
-
-def build_prompt(context: List[str], question: str) -> str:
-    return (
-        "### Context\n"
-        + "\n\n".join(context)
-        + f"\n\n### Question\n{question}\n\n### Answer (concise):"
-    )
-
-
-def main(cfg_path="config.yaml"):
+def main(cfg_path: str = "config.yaml", device: str = "cuda"):
     cfg = yaml.safe_load(Path(cfg_path).read_text())
     paths = cfg["paths"]
     demo_cfg = cfg.get("demo", {})
     top_k = demo_cfg.get("top_k", 3)
     n_threads = demo_cfg.get("n_threads", 8)
 
-    chunks = load_jsonl(paths["pdf_chunks_jsonl"])
-    chunk_texts = [c["text"] for c in chunks]
-    logging.info("Building MiniLM index on %d chunks …", len(chunk_texts))
-    st_model = SentenceTransformer("all-MiniLM-L6-v2", device="cpu")
-    knn = build_index(chunk_texts, st_model)
+    retriever = Retriever(device=device).fit(load_jsonl(paths["pdf_chunks_jsonl"]))
 
-    logging.info("Loading llama.cpp model … (~4-5 s on CPU)")
     llm = Llama(
         model_path=paths["finetuned_gguf"],
         n_threads=n_threads,
-        n_gpu_layers=0,
+        n_gpu_layers=32,
+        n_ctx=default_ctx(),
         logits_all=False,
         verbose=False,
     )
 
-    print("\nRAG demo ready. Type a question (or just press <enter> to quit):\n")
+    print("\nRAG demo ready. Type a question (blank line to quit):\n")
+    try:
+        while True:
+            question = input("> ").strip()
+            if not question:
+                break
 
-    while True:
-        question = input("> ").strip()
-        if not question:
-            break
+            t0 = time.time()
+            ctx_budget = default_ctx() - 128
+            context = retriever(
+                question,
+                k=top_k * 8,
+                max_ctx_tokens=ctx_budget,
+            )
+            while True:
+                prompt = build_rag_prompt(context, question)
+                if num_tokens(prompt) <= ctx_budget:
+                    break
+                context = context[:-1]
 
-        t0 = time.time()
-        q_vec = st_model.encode(question, normalize_embeddings=True)
-        idx = knn(q_vec, top_k)
-        context = [chunk_texts[i] for i in idx]
-        prompt = build_prompt(context, question)
+            answer = llm(
+                prompt,
+                max_tokens=128,
+                temperature=0.2,
+                repeat_penalty=1.1,
+                stop=["###"],
+                echo=False,
+            )["choices"][0]["text"].strip()
 
-        out = llm(
-            prompt,
-            max_tokens=128,
-            temperature=0.2,
-            repeat_penalty=1.1,
-            stop=["###"],
-        )
-        answer = out["choices"][0]["text"].strip()
-        dt = time.time() - t0
+            m = re.search(r"\b(?:list|name|give)\s+(\d+)\b", question, re.I)
+            if m:
+                want = int(m.group(1))
+                got = len(re.findall(r"\[[0-9]+\]", answer))
+                if got != want:
+                    follow = (
+                        prompt
+                        + f"\n\nThe previous answer listed {got} items but exactly {want} are required. "
+                        f"Please list **exactly {want} items** with citations."
+                    )
+                    answer = llm(follow, max_tokens=128, temperature=0.2)["choices"][
+                        0
+                    ]["text"].strip()
 
-        print(f"\n{answer}\n--- ({dt*1000:.0f} ms)\n")
+            print(f"\n{answer}\n--- ({(time.time() - t0)*1000:.0f} ms)\n")
+    except KeyboardInterrupt:
+        print("\nExiting.")
 
 
 if __name__ == "__main__":
@@ -110,4 +93,6 @@ if __name__ == "__main__":
     )
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="config.yaml")
-    main(parser.parse_args().config)
+    parser.add_argument("--device", default="cuda", choices=["cpu", "cuda"])
+    args = parser.parse_args()
+    main(cfg_path=args.config, device=args.device)

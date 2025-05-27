@@ -1,3 +1,6 @@
+numpy==1.26.4
+scipy==1.11.4
+scikit-learn==1.4.2
 pdfplumber==0.10.3
 PyYAML>=6.0
 transformers>=4.40.0
@@ -6,5 +9,13 @@ peft~=0.10
 transformers>=4.40
 accelerate
 llama-cpp-python>=0.2.20
-# test deps
+tenacity>=8.2.3
+faiss-gpu
+openai
+sentence-transformers
+dotenv
+tiktoken
+datasets
+protobuf>=4.25
 pytest>=8.0.0
+pre-commit

@@ -1,83 +1,108 @@
 from __future__ import annotations
 
-import argparse, json, logging, time
+import argparse
+import json
+import logging
+import time
 from pathlib import Path
-from typing import List, Dict
+from typing import Callable, Dict, List
 
-import faiss
 import numpy as np
 import yaml
+from huggingface_hub import hf_hub_download
+from torch import cuda
 from tqdm import tqdm
-from sentence_transformers import SentenceTransformer
+
+from src.prompts import SYSTEM_JUDGE, build_judge_user, build_rag_prompt
+from src.retrieval import Retriever
+from src.utils import default_ctx, dynamic_gpu_layers
 
 
-def load_config(path: str | Path) -> Dict:
-    with open(path, "r", encoding="utf-8") as fh:
-        return yaml.safe_load(fh)
-
-def load_jsonl(path: str | Path) -> List[Dict]:
-    with open(path, "r", encoding="utf-8") as fh:
-        return [json.loads(line) for line in fh]
-
-def cosine(u: np.ndarray, v: np.ndarray):
-    return 1 - np.dot(u, v) / (np.linalg.norm(u) * np.linalg.norm(v) + 1e-9)
+def _load_jsonl(p: str | Path) -> List[Dict]:
+    with open(p, encoding="utf-8") as fh:
+        return [json.loads(l) for l in fh]
 
 
-def build_faiss(chunks: List[Dict], embed_model: SentenceTransformer):
-    texts = [c["text"] for c in chunks]
-    embs = embed_model.encode(texts, show_progress_bar=True, normalize_embeddings=True).astype(
-        "float32"
+def _ensure_base_gguf(
+    path: str,
+    repo_id: str = "QuantFactory/Llama-3.2-1B-GGUF",
+    fn: str = "Llama-3.2-1B.Q8_0.gguf",
+) -> str:
+    tgt = Path(path)
+    if tgt.exists():
+        logging.info("Using cached baseline GGUF %s", tgt)
+        return str(tgt)
+    logging.info("Baseline GGUF missing – downloading …")
+    hf_hub_download(
+        repo_id=repo_id,
+        filename=fn,
+        local_dir=str(tgt.parent),
+        local_dir_use_symlinks=False,
     )
-    index = faiss.IndexFlatIP(embs.shape[1])
-    index.add(embs)
-    return index, embs
+    return str(tgt)
 
 
-def retrieve_hits(
-    qa_set: List[Dict],
-    chunks: List[Dict],
-    embed_model: SentenceTransformer,
-    index: faiss.Index,
-    k: int = 3,
+def _load_llama(
+    path: str, threads: int, *, embed: bool = False, ngl: int | None = None
 ):
-    chunk_texts = [c["text"] for c in chunks]
-    hits = 0
-    for row in qa_set:
-        q_emb = embed_model.encode(row["question"], normalize_embeddings=True)
-        D, I = index.search(np.array([q_emb], dtype="float32"), k)
-        top_texts = [chunk_texts[i] for i in I[0]]
-        if any(row["answer"].strip().lower() in t.lower() for t in top_texts):
-            hits += 1
-    return hits / len(qa_set)
+    from llama_cpp import Llama
+
+    return Llama(
+        model_path=path,
+        n_ctx=default_ctx(),
+        n_threads=threads,
+        n_gpu_layers=dynamic_gpu_layers(ngl or 32),
+        logits_all=False,
+        embedding=embed,
+    )
 
 
-SYSTEM_JUDGE = """You are an impartial grader. 
-Given a question, the reference answer, and a candidate answer, 
-return "1" if the candidate answer means the same thing as the reference answer
-(even if wording differs) and return "0" otherwise.
-Return ONLY "1" or "0" with no other text."""
+def _llama_embed(llm, text: str) -> np.ndarray:
+    return np.array(llm.embed(text), dtype="float32")
 
-def judge_answers_openai(items: List[Dict], model="gpt-4o-mini"):
-    """items: [{'question','reference','candidate'}] -> list[int]"""
+
+def _hits(
+    qa: List[Dict],
+    passages: List[str],
+    *,
+    knn: Callable[[np.ndarray, int], List[int]],
+    q_embed: Callable[[str], np.ndarray],
+    k: int,
+) -> float:
+    good = 0
+    for row in qa:
+        idx = knn(q_embed(row["question"]), k=k)
+        if any(row["answer"].lower() in passages[i].lower() for i in idx):
+            good += 1
+    return good / len(qa)
+
+
+def _uplift(a: float, b: float) -> tuple[float, float]:
+    delta = b - a
+    return delta, (delta / a * 100) if a else float("inf")
+
+
+def judge_answers_openai(
+    items: List[Dict],
+    model: str = "gpt-4o-mini",
+) -> List[int]:
+    """Use an OpenAI model to grade answers – 1 == match, 0 == mismatch."""
     from openai import OpenAI
+
     client = OpenAI()
-    results = []
+    results: List[int] = []
+
     for it in tqdm(items, desc="LLM-judge"):
-        prompt = (
-            f"Question: {it['question']}\n"
-            f"Reference answer: {it['reference']}\n"
-            f"Candidate answer: {it['candidate']}\n"
-            "Does the candidate match the reference? Return 1 or 0."
-        )
+        prompt = build_judge_user(it["question"], it["reference"], it["candidate"])
         while True:
             try:
                 resp = client.chat.completions.create(
                     model=model,
+                    temperature=0,
                     messages=[
                         {"role": "system", "content": SYSTEM_JUDGE},
                         {"role": "user", "content": prompt},
                     ],
-                    temperature=0,
                 )
                 token = resp.choices[0].message.content.strip()
                 results.append(1 if token.startswith("1") else 0)
@@ -85,93 +110,91 @@ def judge_answers_openai(items: List[Dict], model="gpt-4o-mini"):
             except Exception as e:
                 logging.warning("Judge API error %s – retrying in 5 s", e)
                 time.sleep(5)
+
     return results
 
 
-def load_llama(model_path: str, n_threads: int = 8):
-    from llama_cpp import Llama
-    return Llama(model_path=model_path, n_threads=n_threads, n_gpu_layers=0, logits_all=False)
-
-def answer_with_llama(llm, prompt: str, max_tokens: int = 128) -> str:
-    out = llm(
-        prompt,
-        max_tokens=max_tokens,
-        echo=False,
-        temperature=0.2,
-        repeat_penalty=1.1,
-    )
-    return out["choices"][0]["text"].strip()
-
-
-def evaluate(cfg_path="config.yaml"):
-    cfg = load_config(cfg_path)
+def evaluate(cfg_path: str = "config.yaml"):
+    cfg = yaml.safe_load(Path(cfg_path).read_text())
     paths = cfg["paths"]
-    ev_cfg = cfg["evaluate"]
+    ev = cfg["evaluate"]
 
-    chunks = load_jsonl(paths["pdf_chunks_jsonl"])
-    eval_set = load_jsonl(paths["eval_manual_jsonl"]) + load_jsonl(paths["eval_holdout_jsonl"])
-    eval_set = eval_set[: ev_cfg.get("max_eval", len(eval_set))] 
+    chunks = _load_jsonl(paths["pdf_chunks_jsonl"])
+    passages = [c["text"] for c in chunks]
 
+    eval_set = (
+        _load_jsonl(paths["eval_manual_jsonl"])
+        + _load_jsonl(paths["eval_holdout_jsonl"])
+    )[: ev.get("max_eval", 9999)]
     logging.info("Eval set size: %d", len(eval_set))
 
-    logging.info("Loading sentence-transformer …")
-    st_model = SentenceTransformer("all-MiniLM-L6-v2", device="cpu")
-    index, _ = build_faiss(chunks, st_model)
+    retriever = Retriever(device="cuda" if cuda.is_available() else "cpu").fit(
+        chunks
+    )
 
-    hits_base = retrieve_hits(eval_set, chunks, st_model, index, k=ev_cfg["top_k"])
-    logging.info("Hits@%d (embedding retrieval): %.3f", ev_cfg["top_k"], hits_base)
+    base_path = _ensure_base_gguf(paths["base_gguf"])
+    llama_base = _load_llama(base_path, ev["n_threads"], embed=True)
+    llama_tune = _load_llama(paths["finetuned_gguf"], ev["n_threads"], embed=True)
 
-    logging.info("Loading base + fine-tuned gguf …")
-    llama_base = load_llama(cfg["finetune"]["base_model_path_gguf"], ev_cfg["n_threads"])
-    llama_tuned = load_llama(paths["finetuned_gguf"], ev_cfg["n_threads"])
+    hits_base = _hits(
+        eval_set,
+        passages,
+        knn=retriever._knn,
+        q_embed=lambda q: _llama_embed(llama_base, q),
+        k=ev["top_k"],
+    )
+    hits_tune = _hits(
+        eval_set,
+        passages,
+        knn=retriever._knn,
+        q_embed=lambda q: _llama_embed(llama_tune, q),
+        k=ev["top_k"],
+    )
 
-    judge_items_base, judge_items_tuned = [], []
-
-    for row in tqdm(eval_set, desc="gen answers"):
+    judge_items_b, judge_items_t = [], []
+    for row in tqdm(eval_set, desc="generate answers"):
         q = row["question"]
-        q_emb = st_model.encode(q, normalize_embeddings=True)
-        _, I = index.search(np.array([q_emb], dtype="float32"), ev_cfg["top_k"])
-        context = "\n".join(chunks[i]["text"] for i in I[0])
-        prompt = f"Context:\n{context}\n\nQuestion: {q}\nAnswer:"
+        context = retriever(q, n_final=ev["top_k"])
+        prompt = build_rag_prompt(context, q)
 
-        ans_base = answer_with_llama(llama_base, prompt)
-        ans_tune = answer_with_llama(llama_tuned, prompt)
+        ans_b = llama_base(prompt, max_tokens=128, temperature=0.2)["choices"][0][
+            "text"
+        ].strip()
+        ans_t = llama_tune(prompt, max_tokens=128, temperature=0.2)["choices"][0][
+            "text"
+        ].strip()
 
-        judge_items_base.append(
-            {"question": q, "reference": row["answer"], "candidate": ans_base}
+        judge_items_b.append(
+            {"question": q, "reference": row["answer"], "candidate": ans_b}
         )
-        judge_items_tuned.append(
-            {"question": q, "reference": row["answer"], "candidate": ans_tune}
+        judge_items_t.append(
+            {"question": q, "reference": row["answer"], "candidate": ans_t}
         )
 
-    acc_base = np.mean(judge_answers_openai(judge_items_base))
-    acc_tune = np.mean(judge_answers_openai(judge_items_tuned))
+    acc_base = float(np.mean(judge_answers_openai(judge_items_b)))
+    acc_tune = float(np.mean(judge_answers_openai(judge_items_t)))
 
-    def uplift(b, t):
-        delta_pp = t - b
-        delta_pct = (delta_pp / b * 100) if b > 0 else float("inf")
-        return delta_pp, delta_pct
+    d_hits_pp, d_hits_pct = _uplift(hits_base, hits_tune)
+    d_acc_pp, d_acc_pct = _uplift(acc_base, acc_tune)
 
-    dpp_hits, dpct_hits = uplift(hits_base, hits_base) 
-    dpp_ans, dpct_ans = uplift(acc_base, acc_tune)
-
-    print("\n=== Evaluation Summary ===\n")
-    print(f"{'Metric':<15} {'Base':>6} {'Tuned':>6} {'Δ(pp)':>8} {'Δ(%)':>8}")
-    print("-" * 45)
+    print("\n=== Evaluation Summary ===")
+    print(f"{'Metric':<15}{'Base':>7}{'Tuned':>8}{'Δ(pp)':>9}{'Δ(%)':>9}")
+    print("-" * 50)
     print(
-        f"{'Hits@'+str(ev_cfg['top_k']):<15} "
-        f"{hits_base:6.2f} {hits_base:6.2f} {dpp_hits:+8.2f} {dpct_hits:+7.0f}%"
+        f"Hits@{ev['top_k']:<10}{hits_base:7.2f}{hits_tune:8.2f}"
+        f"{d_hits_pp:+9.2f}{d_hits_pct:+8.0f}%"
     )
     print(
-        f"{'LLM-judge':<15} "
-        f"{acc_base:6.2f} {acc_tune:6.2f} {dpp_ans:+8.2f} {dpct_ans:+7.0f}%"
+        f"LLM-judge     {acc_base:7.2f}{acc_tune:8.2f}"
+        f"{d_acc_pp:+9.2f}{d_acc_pct:+8.0f}%\n"
     )
-    print()
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default="config.yaml")
-    args = parser.parse_args()
-    evaluate(args.config)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(message)s",
+    )
+    argp = argparse.ArgumentParser()
+    argp.add_argument("--config", default="config.yaml")
+    evaluate(argp.parse_args().config)

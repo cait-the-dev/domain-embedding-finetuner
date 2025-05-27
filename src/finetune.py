@@ -1,17 +1,24 @@
-import argparse, logging, torch
+import argparse
+import logging
+from pathlib import Path
+
+import torch
 from datasets import load_dataset
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     BitsAndBytesConfig,
-    TrainingArguments,
     Trainer,
+    TrainingArguments,
 )
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-from pathlib import Path
-from utils import load_config
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+from src.utils import load_config
+
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s"
+)
+
 
 def make_dataset(train_path: str, tokenizer, max_len: int):
     raw_ds = load_dataset("json", data_files=train_path, split="train")
@@ -29,12 +36,27 @@ def make_dataset(train_path: str, tokenizer, max_len: int):
     tokenized = raw_ds.map(_tokenize, remove_columns=list(raw_ds.features))
     return tokenized
 
+
+def _model_available(id_or_path: str) -> bool:
+    p = Path(id_or_path)
+    return p.is_dir() and any(p.glob("*.bin")) and (p / "tokenizer.json").exists()
+
+
 def main(cfg_path: str):
     cfg = load_config(cfg_path)
     ft_cfg = cfg["finetune"]
     paths = cfg["paths"]
 
-    tokenizer = AutoTokenizer.from_pretrained(ft_cfg["base_model_id"])
+    base_id = ft_cfg["base_model_id"]
+
+    if not _model_available(base_id):
+        logging.warning(
+            "[finetune] Full base model not found at %s – skipping finetune step.",
+            base_id,
+        )
+        return
+
+    tokenizer = AutoTokenizer.from_pretrained(base_id, trust_remote_code=False)
     tokenizer.pad_token = tokenizer.eos_token
 
     bnb_cfg = BitsAndBytesConfig(
@@ -60,7 +82,7 @@ def main(cfg_path: str):
     model = get_peft_model(base_model, lora)
     model.print_trainable_parameters()
 
-    train_jsonl = paths["train_jsonl"] 
+    train_jsonl = paths["train_jsonl"]
     ds = make_dataset(train_jsonl, tokenizer, ft_cfg["max_seq_len"])
 
     training_args = TrainingArguments(
@@ -70,7 +92,7 @@ def main(cfg_path: str):
         gradient_accumulation_steps=ft_cfg["grad_accum"],
         learning_rate=ft_cfg["learning_rate"],
         lr_scheduler_type="cosine",
-        bf16=True, 
+        bf16=True,
         logging_steps=20,
         save_strategy="epoch",
         report_to="none",
@@ -118,7 +140,8 @@ def main(cfg_path: str):
             vocab_type="llama",
             use_mmap=False,
         )
-    logging.info("✅ Finetune complete")
+    logging.info("Finetune complete")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
