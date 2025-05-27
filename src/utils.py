@@ -2,15 +2,14 @@ from __future__ import annotations
 
 import json
 import os
-import platform
 import re
 from pathlib import Path
 from typing import Any, Callable, Dict, List
 
 import yaml
+from torch import cuda
 
 ROOT = Path(__file__).resolve().parent.parent
-
 _USE_HF: bool = bool(int(os.getenv("USE_HF_TOKENIZER", "0")))
 
 
@@ -29,8 +28,9 @@ def _build_token_counter() -> Callable[[str], int]:
             return lambda s: len(tok.encode(s))
         except Exception as e:
             print("[utils] HF tokenizer unavailable –", e)
+
     try:
-        import tiktoken  
+        import tiktoken
 
         enc = tiktoken.get_encoding("cl100k_base")
         return lambda s: len(enc.encode(s))
@@ -40,8 +40,9 @@ def _build_token_counter() -> Callable[[str], int]:
 
 _num_tokens: Callable[[str], int] = _build_token_counter()
 
-if platform.system() == "Windows":
-    os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+
+def num_tokens(text: str) -> int:
+    return _num_tokens(text)
 
 
 def load_config(path: str | Path | None = None) -> Dict[str, Any]:
@@ -64,12 +65,28 @@ def save_jsonl(data: List[Dict[str, Any]], path: str | Path, mode: str = "w"):
 def chunk_text(text: str, max_tokens: int, overlap: float = 0.25) -> List[str]:
     tokens = text.split()
     stride = int(max_tokens * (1 - overlap)) or max_tokens
-    out: List[str] = []
+    min_len = int(max_tokens * 0.8)
+
+    chunks: List[str] = []
     idx = 0
     while idx < len(tokens):
-        window = tokens[idx : idx + max_tokens]
-        joined = " ".join(window)
-        if _num_tokens(joined) >= 40:
-            out.append(joined)
+        window_tokens = tokens[idx : idx + max_tokens]
+        if len(window_tokens) < min_len:
+            break
+        chunk = " ".join(window_tokens)
+        if _num_tokens(chunk) >= 40:
+            chunks.append(chunk)
         idx += stride
-    return out
+    return chunks
+
+
+def dynamic_gpu_layers(requested: int = 32) -> int:
+    return requested if cuda.is_available() else 0
+
+
+def default_ctx(model_ctx: int | None = None) -> int:
+    return int(
+        os.getenv(
+            "LLAMA_MAX_CTX", 4096 if model_ctx is None else min(model_ctx, 8192)
+        )
+    )

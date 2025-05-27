@@ -1,0 +1,39 @@
+############################################
+# Build Stage
+FROM nvidia/cuda:12.8.0-devel-ubuntu22.04 AS build
+
+ARG DEBIAN_FRONTEND=noninteractive
+WORKDIR /app
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        git build-essential cmake curl && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN apt-get update && apt-get install -y python3.11 python3-venv && \
+    python3 -m venv /venv && \
+    /venv/bin/pip install -U pip
+
+COPY . /app
+ENV CMAKE_ARGS="-DGGML_CUDA=ON"
+RUN ln -s /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1 && \
+    echo "/usr/local/cuda/lib64/stubs" >> /etc/ld.so.conf.d/z-cuda-stubs.conf && ldconfig
+RUN /venv/bin/pip install -r requirements.txt
+
+#######################################
+# Runtime Stage
+FROM nvidia/cuda:12.8.0-runtime-ubuntu22.04 AS runtime
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends python3.11 python3-venv make && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /venv /venv
+ENV PATH="/venv/bin:${PATH}"
+WORKDIR /app
+COPY . /app
+
+RUN useradd -m runner
+USER runner
+
+CMD ["make", "all"]

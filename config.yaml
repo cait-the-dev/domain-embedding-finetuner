@@ -1,16 +1,22 @@
 paths:
   pdf: data/raw/army_manual.pdf
   pdf_chunks_jsonl: data/pdf_chunks.jsonl
-  eval_manual_jsonl: data/eval_manual.jsonl      # 20 hand-written
-  eval_holdout_jsonl: data/eval_holdout.jsonl    # 30 held-out synthetic
+  train_jsonl:      data/train.jsonl
+  eval_manual_jsonl: data/eval_manual.jsonl
+  eval_holdout_jsonl: data/eval_holdout.jsonl
   finetuned_gguf: models/finetuned.gguf
-
+  base_gguf: models/Llama-3.2-1B.Q8_0.gguf
+  
 ingest:
   max_tokens: 300
   overlap: 0.25
 
+generate:
+  batch_size: 25
+  max_rows: 120  # bump to 500 for full run
+
 finetune:
-  base_model_id: QuantFactory/Llama-3.2-1B
+  base_model_id: models/llama-3.2-1b
   output_dir: models/lora_adapter
   merged_gguf: models/finetuned.gguf
 
@@ -29,4 +35,13 @@ evaluate:
   top_k: 3
   max_eval: 50   
   n_threads: 8
-  
+  embed_model_path: models/minilm
+
+demo:
+  top_k: 3
+  n_threads: 8
+
+retrieval:
+  top_k: 32
+  rerank_final: 4
+  max_ctx_tokens: 1600

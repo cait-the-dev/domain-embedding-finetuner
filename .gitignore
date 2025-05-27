@@ -58,3 +58,5 @@ build/
 *.tar
 *.tar.gz
 *.zip
+
+models/*
